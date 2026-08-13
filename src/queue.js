@@ -52,7 +52,10 @@ export async function getQueue() {
       const { Queue } = await import('bullmq');
       const ioredis = await import('ioredis');
       const Redis = ioredis.default || ioredis;
-      const connection = new Redis(REDIS_URL);
+      const connection = new Redis(REDIS_URL, {
+        maxRetriesPerRequest: null,
+        enableReadyCheck: false,
+      });
       
       const bullQueue = new Queue('forensics', { connection });
       console.log('[Queue] Initialized BullMQ Redis Queue.');
