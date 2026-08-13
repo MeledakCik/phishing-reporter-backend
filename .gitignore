@@ -1,0 +1,17 @@
+# Node dependencies
+node_modules/
+
+# Local database and generated artifacts
+database.sqlite
+dispatched_emails/
+dispatched_threat_reports/
+public/screenshots/*.jpg
+!public/screenshots/.gitkeep
+
+# Environment variables
+.env
+
+# System & Editor files
+.DS_Store
+Thumbs.db
+*.log
