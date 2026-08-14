@@ -1,8 +1,10 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { Resend } from 'resend';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ---------------------------------------------------------------------------
 // Real email dispatch via the Resend API (https://resend.com).
@@ -128,6 +130,60 @@ Local Anti-Phishing & Takedown Community Hub
 
   const shot = screenshotFilePath(report);
   return dispatchEmail({ to, subject, body, attachmentPath: shot, attachmentName: `${report.id}.jpg` });
+}
+
+// 1b. Vercel abuse-desk report (real send via Resend SDK).
+// Vercel has no public "report abuse" API - the documented/legitimate
+// channel is emailing abuse@vercel.com directly, so this bypasses
+// dispatchEmail() and calls the Resend SDK's HTML send path.
+export async function reportToVercelAbuse(phishingUrl) {
+  const from = process.env.MAIL_FROM;
+  const to = 'abuse@vercel.com';
+  const subject = `Phishing Takedown - ${phishingUrl}`;
+  const timestamp = new Date().toISOString();
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; font-size: 14px; color: #111;">
+      <h2>Phishing Takedown Request</h2>
+      <p>We are reporting a phishing site hosted on Vercel's infrastructure.</p>
+      <table cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+        <tr>
+          <td style="border: 1px solid #ddd;"><strong>Phishing URL</strong></td>
+          <td style="border: 1px solid #ddd;">${phishingUrl}</td>
+        </tr>
+        <tr>
+          <td style="border: 1px solid #ddd;"><strong>Reported At (UTC)</strong></td>
+          <td style="border: 1px solid #ddd;">${timestamp}</td>
+        </tr>
+      </table>
+      <p>
+        This URL is being used to impersonate a legitimate brand and harvest
+        user credentials/personal data. Please investigate and take down this
+        deployment as soon as possible.
+      </p>
+      <p>Thank you for your prompt attention to this matter.</p>
+    </div>
+  `;
+
+  try {
+    const { data, error } = await resend.emails.send({
+      from,
+      to: [to],
+      subject,
+      html,
+    });
+
+    if (error) {
+      console.error(`[Mailer] Resend SDK error reporting to Vercel abuse:`, error);
+      return { to, subject, status: 'FAILED', error };
+    }
+
+    console.log(`[Mailer] Vercel abuse report sent. Message ID: ${data?.id}`);
+    return { to, subject, status: 'SENT', ...data };
+  } catch (err) {
+    console.error(`[Mailer] Resend SDK request failed:`, err.message);
+    return { to, subject, status: 'FAILED', error: err.message };
+  }
 }
 
 // 2. Kominfo (Indonesian Ministry of Communication) content-abuse intake.
