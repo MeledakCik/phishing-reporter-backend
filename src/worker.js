@@ -122,13 +122,24 @@ async function checkOpenPorts(hostname) {
   return results;
 }
 
-// Check the hostname against abuse.ch URLhaus, a free public malware/phishing
-// URL database - no API key required.
+// Check the hostname against abuse.ch URLhaus, a public malware/phishing
+// URL database. As of their updated policy, this requires a free Auth-Key
+// (get one at https://auth.abuse.ch/) sent via the "Auth-Key" header.
 async function checkBlacklist(hostname) {
+  const authKey = process.env.URLHAUS_AUTH_KEY;
+  if (!authKey) {
+    return {
+      status: 'UNKNOWN',
+      detail: 'URLHAUS_AUTH_KEY not configured - get a free key at auth.abuse.ch'
+    };
+  }
   try {
     const res = await fetch('https://urlhaus-api.abuse.ch/v1/host/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Auth-Key': authKey
+      },
       body: `host=${encodeURIComponent(hostname)}`
     });
     if (!res.ok) {
