@@ -42,6 +42,17 @@ export async function getDb() {
       abuse_email TEXT,
       outgoing_links TEXT DEFAULT '[]',
       last_checked_at TEXT,
+      ssl_status TEXT,
+      ssl_issuer TEXT,
+      ssl_expiry TEXT,
+      ssl_days_left INTEGER,
+      domain_registered_at TEXT,
+      domain_age_days INTEGER,
+      registrar_name TEXT,
+      open_ports TEXT,
+      blacklist_status TEXT,
+      blacklist_detail TEXT,
+      cdn_provider TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -55,6 +66,30 @@ export async function getDb() {
     CREATE INDEX IF NOT EXISTS idx_reported_url ON reports(reported_url);
     CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
   `);
+
+  // Migration: add new analysis columns to pre-existing databases that
+  // were created before these columns existed. ALTER TABLE ADD COLUMN
+  // fails harmlessly if the column is already there.
+  const newColumns = [
+    'ssl_status TEXT',
+    'ssl_issuer TEXT',
+    'ssl_expiry TEXT',
+    'ssl_days_left INTEGER',
+    'domain_registered_at TEXT',
+    'domain_age_days INTEGER',
+    'registrar_name TEXT',
+    'open_ports TEXT',
+    'blacklist_status TEXT',
+    'blacklist_detail TEXT',
+    'cdn_provider TEXT'
+  ];
+  for (const columnDef of newColumns) {
+    try {
+      await dbConnection.run(`ALTER TABLE reports ADD COLUMN ${columnDef}`);
+    } catch (err) {
+      // Column already exists - ignore
+    }
+  }
 
   // Seed default Indonesian brands if table is empty
   const countResult = await dbConnection.get('SELECT COUNT(*) as count FROM brand_suggestions');

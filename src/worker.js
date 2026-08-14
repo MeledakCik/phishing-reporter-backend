@@ -1,6 +1,7 @@
 import { chromium } from 'playwright';
 import dns from 'dns/promises';
 import net from 'net';
+import tls from 'tls';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -42,6 +43,133 @@ function getMainDomain(hostname) {
   return parts.slice(len - 2).join('.');
 }
 
+// --- Real security checks (replaces previously hardcoded/simulated data) ---
+
+// Check the live TLS/SSL certificate by opening a real TLS socket to port 443
+function checkSSL(hostname) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    try {
+      const socket = tls.connect(
+        { host: hostname, port: 443, servername: hostname, timeout: 6000, rejectUnauthorized: false },
+        () => {
+          const cert = socket.getPeerCertificate();
+          socket.end();
+          if (cert && Object.keys(cert).length > 0 && cert.valid_to) {
+            const now = new Date();
+            const validTo = new Date(cert.valid_to);
+            const daysLeft = Math.round((validTo.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+            finish({
+              status: daysLeft <= 0 ? 'CRITICAL' : daysLeft < 14 ? 'WARNING' : 'PASSED',
+              issuer: cert.issuer?.O || cert.issuer?.CN || 'Unknown Issuer',
+              expiry: cert.valid_to,
+              daysLeft
+            });
+          } else {
+            finish({ status: 'UNKNOWN', issuer: null, expiry: null, daysLeft: null });
+          }
+        }
+      );
+      socket.on('error', (err) => {
+        finish({ status: 'CRITICAL', issuer: null, expiry: null, daysLeft: null, error: err.message });
+      });
+      socket.on('timeout', () => {
+        socket.destroy();
+        finish({ status: 'UNKNOWN', issuer: null, expiry: null, daysLeft: null, error: 'Connection timeout' });
+      });
+    } catch (err) {
+      finish({ status: 'UNKNOWN', issuer: null, expiry: null, daysLeft: null, error: err.message });
+    }
+  });
+}
+
+// Check whether a single TCP port is open via a real connection attempt
+function checkPort(hostname, port, timeout = 1500) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let open = false;
+    socket.setTimeout(timeout);
+    socket.once('connect', () => {
+      open = true;
+      socket.destroy();
+    });
+    socket.once('timeout', () => socket.destroy());
+    socket.once('error', () => socket.destroy());
+    socket.once('close', () => resolve(open));
+    socket.connect(port, hostname);
+  });
+}
+
+// Scan a short list of commonly abused ports (real TCP connect, not simulated)
+async function checkOpenPorts(hostname) {
+  const portsToCheck = [
+    { port: 21, label: 'FTP' },
+    { port: 22, label: 'SSH' },
+    { port: 80, label: 'HTTP' },
+    { port: 443, label: 'HTTPS' },
+    { port: 3306, label: 'MySQL' },
+    { port: 3389, label: 'RDP' }
+  ];
+  const results = await Promise.all(
+    portsToCheck.map(async (p) => ({ ...p, open: await checkPort(hostname, p.port) }))
+  );
+  return results;
+}
+
+// Check the hostname against abuse.ch URLhaus, a free public malware/phishing
+// URL database - no API key required.
+async function checkBlacklist(hostname) {
+  try {
+    const res = await fetch('https://urlhaus-api.abuse.ch/v1/host/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `host=${encodeURIComponent(hostname)}`
+    });
+    if (!res.ok) {
+      return { status: 'UNKNOWN', detail: `URLhaus lookup returned HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    if (data.query_status === 'ok') {
+      const urlCount = Array.isArray(data.urls) ? data.urls.length : 0;
+      return {
+        status: 'CRITICAL',
+        detail: `Listed on URLhaus: ${urlCount} malicious URL(s) reported for this host`
+      };
+    }
+    return { status: 'PASSED', detail: 'Not found on URLhaus abuse database' };
+  } catch (err) {
+    return { status: 'UNKNOWN', detail: `Blacklist check failed: ${err.message}` };
+  }
+}
+
+// Detect CDN/WAF providers from real HTTP response headers
+async function detectCDN(url) {
+  try {
+    const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+    const server = (res.headers.get('server') || '').toLowerCase();
+    const via = (res.headers.get('via') || '').toLowerCase();
+    const servedBy = (res.headers.get('x-served-by') || '').toLowerCase();
+    const combined = `${server} ${via} ${servedBy}`;
+
+    if (res.headers.get('cf-ray') || combined.includes('cloudflare')) return 'Cloudflare';
+    if (combined.includes('akamai')) return 'Akamai';
+    if (combined.includes('fastly')) return 'Fastly';
+    if (combined.includes('cloudfront')) return 'Amazon CloudFront';
+    if (combined.includes('sucuri')) return 'Sucuri';
+    if (combined.includes('imperva') || combined.includes('incapsula')) return 'Imperva';
+    if (combined.includes('vercel')) return 'Vercel Edge Network';
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
 export async function processForensicJob(jobData) {
   const { reportId, url } = jobData;
   console.log(`[Worker] Starting forensic processing for Report ID: ${reportId}, URL: ${url}`);
@@ -56,6 +184,8 @@ export async function processForensicJob(jobData) {
   let registrarAbuseEmail = null;
   let ipHostingProvider = 'Unknown';
   let ipAbuseEmail = null;
+  let domainRegisteredAt = null;
+  let domainAgeDays = null;
 
   const parsedUrl = new URL(url);
   const hostname = parsedUrl.hostname;
@@ -93,6 +223,18 @@ export async function processForensicJob(jobData) {
         // Extract registrar abuse email
         registrarAbuseEmail = extractAbuseEmail(rdapData);
         console.log(`[Worker] Domain RDAP - Registrar: ${registrarName}, Abuse Email: ${registrarAbuseEmail}`);
+
+        // Extract domain registration date for real domain-age calculation
+        if (Array.isArray(rdapData.events)) {
+          const regEvent = rdapData.events.find(e => e.eventAction === 'registration');
+          if (regEvent && regEvent.eventDate) {
+            domainRegisteredAt = regEvent.eventDate;
+            const now = new Date();
+            const registeredDate = new Date(regEvent.eventDate);
+            domainAgeDays = Math.round((now.getTime() - registeredDate.getTime()) / (1000 * 60 * 60 * 24));
+            console.log(`[Worker] Domain registered ${domainAgeDays} days ago (${domainRegisteredAt})`);
+          }
+        }
       }
     } catch (err) {
       console.error(`[Worker] Domain RDAP query failed:`, err.message);
@@ -194,6 +336,17 @@ export async function processForensicJob(jobData) {
   } else if (ipAbuseEmail) {
     abuseEmail = ipAbuseEmail;
   }
+
+  // 3b. Run real security checks in parallel: SSL cert, open ports,
+  // blacklist status, and CDN detection. None of these are simulated.
+  console.log(`[Worker] Running SSL / port scan / blacklist / CDN checks for ${hostname}`);
+  const [sslResult, portsResult, blacklistResult, cdnProvider] = await Promise.all([
+    checkSSL(hostname),
+    checkOpenPorts(hostname),
+    checkBlacklist(hostname),
+    detectCDN(url)
+  ]);
+  console.log(`[Worker] SSL: ${sslResult.status}, Blacklist: ${blacklistResult.status}, CDN: ${cdnProvider || 'None detected'}`);
 
   // 4. Playwright browser setup (Mobile Spoofing & Screenshot & Outgoing Links)
   let browser = null;
@@ -303,6 +456,18 @@ export async function processForensicJob(jobData) {
            abuse_email = ?, 
            screenshot_url = ?, 
            outgoing_links = ?,
+           ssl_status = ?,
+           ssl_issuer = ?,
+           ssl_expiry = ?,
+           ssl_days_left = ?,
+           domain_registered_at = ?,
+           domain_age_days = ?,
+           registrar_name = ?,
+           open_ports = ?,
+           blacklist_status = ?,
+           blacklist_detail = ?,
+           cdn_provider = ?,
+           last_checked_at = datetime('now'),
            updated_at = datetime('now')
        WHERE id = ?`,
       ipAddress,
@@ -310,6 +475,17 @@ export async function processForensicJob(jobData) {
       abuseEmail,
       screenshotUrl || null,
       JSON.stringify(crossDomainLinks),
+      sslResult.status,
+      sslResult.issuer,
+      sslResult.expiry,
+      sslResult.daysLeft,
+      domainRegisteredAt,
+      domainAgeDays,
+      registrarName !== 'Unknown' ? registrarName : null,
+      JSON.stringify(portsResult),
+      blacklistResult.status,
+      blacklistResult.detail,
+      cdnProvider,
       reportId
     );
     console.log(`[Worker] Database record updated successfully for Report ID: ${reportId}`);
