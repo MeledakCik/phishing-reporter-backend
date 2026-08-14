@@ -159,6 +159,44 @@ async function checkBlacklist(hostname) {
   }
 }
 
+// Check a URL against the real Google Safe Browsing Lookup API (v4).
+// This is a genuine verification check (is the URL already known-malicious
+// to Google), NOT a submission - Google does not offer a public API to
+// submit new URLs, only a manual report form. Requires a free API key from
+// Google Cloud Console (Safe Browsing API) set as GOOGLE_SAFE_BROWSING_API_KEY.
+async function checkGoogleSafeBrowsing(url) {
+  const apiKey = process.env.GOOGLE_SAFE_BROWSING_API_KEY;
+  if (!apiKey) {
+    return { status: 'UNKNOWN', threatTypes: null, detail: 'GOOGLE_SAFE_BROWSING_API_KEY not configured' };
+  }
+  try {
+    const res = await fetch(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client: { clientId: 'phishing-reporter-backend', clientVersion: '1.0.0' },
+        threatInfo: {
+          threatTypes: ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE', 'POTENTIALLY_HARMFUL_APPLICATION'],
+          platformTypes: ['ANY_PLATFORM'],
+          threatEntryTypes: ['URL'],
+          threatEntries: [{ url }]
+        }
+      })
+    });
+    if (!res.ok) {
+      return { status: 'UNKNOWN', threatTypes: null, detail: `Safe Browsing API returned HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    if (Array.isArray(data.matches) && data.matches.length > 0) {
+      const types = [...new Set(data.matches.map(m => m.threatType))].join(', ');
+      return { status: 'FLAGGED', threatTypes: types, detail: `Already flagged by Google Safe Browsing: ${types}` };
+    }
+    return { status: 'CLEAN', threatTypes: null, detail: 'Not currently flagged by Google Safe Browsing' };
+  } catch (err) {
+    return { status: 'UNKNOWN', threatTypes: null, detail: `Safe Browsing check failed: ${err.message}` };
+  }
+}
+
 // Detect CDN/WAF providers from real HTTP response headers
 async function detectCDN(url) {
   try {
@@ -351,13 +389,14 @@ export async function processForensicJob(jobData) {
   // 3b. Run real security checks in parallel: SSL cert, open ports,
   // blacklist status, and CDN detection. None of these are simulated.
   console.log(`[Worker] Running SSL / port scan / blacklist / CDN checks for ${hostname}`);
-  const [sslResult, portsResult, blacklistResult, cdnProvider] = await Promise.all([
+  const [sslResult, portsResult, blacklistResult, cdnProvider, gsbResult] = await Promise.all([
     checkSSL(hostname),
     checkOpenPorts(hostname),
     checkBlacklist(hostname),
-    detectCDN(url)
+    detectCDN(url),
+    checkGoogleSafeBrowsing(url)
   ]);
-  console.log(`[Worker] SSL: ${sslResult.status}, Blacklist: ${blacklistResult.status}, CDN: ${cdnProvider || 'None detected'}`);
+  console.log(`[Worker] SSL: ${sslResult.status}, Blacklist: ${blacklistResult.status}, CDN: ${cdnProvider || 'None detected'}, Google Safe Browsing: ${gsbResult.status}`);
 
   // 4. Playwright browser setup (Mobile Spoofing & Screenshot & Outgoing Links)
   let browser = null;
@@ -478,6 +517,8 @@ export async function processForensicJob(jobData) {
            blacklist_status = ?,
            blacklist_detail = ?,
            cdn_provider = ?,
+           gsb_status = ?,
+           gsb_threat_types = ?,
            last_checked_at = datetime('now'),
            updated_at = datetime('now')
        WHERE id = ?`,
@@ -497,6 +538,8 @@ export async function processForensicJob(jobData) {
       blacklistResult.status,
       blacklistResult.detail,
       cdnProvider,
+      gsbResult.status,
+      gsbResult.threatTypes,
       reportId
     );
     console.log(`[Worker] Database record updated successfully for Report ID: ${reportId}`);

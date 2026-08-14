@@ -53,6 +53,8 @@ export async function getDb() {
       blacklist_status TEXT,
       blacklist_detail TEXT,
       cdn_provider TEXT,
+      gsb_status TEXT,
+      gsb_threat_types TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -81,7 +83,9 @@ export async function getDb() {
     'open_ports TEXT',
     'blacklist_status TEXT',
     'blacklist_detail TEXT',
-    'cdn_provider TEXT'
+    'cdn_provider TEXT',
+    'gsb_status TEXT',
+    'gsb_threat_types TEXT'
   ];
   for (const columnDef of newColumns) {
     try {

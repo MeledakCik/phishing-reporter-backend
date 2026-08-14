@@ -1,14 +1,12 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { sendAbuseReport } from './mailer.js';
+import { sendAbuseReport, sendKominfoReport } from './mailer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export async function dispatchMultiChannelThreatReport(report) {
   const targetUrl = report.reported_url;
-  const hostname = new URL(targetUrl).hostname;
-  const brand = report.target_brand_raw || 'Unknown Brand';
 
   console.log(`\n==================================================`);
   console.log(`[Multi-Channel Dispatcher] INITIATING MULTI-VECTOR REPORT FOR: ${targetUrl}`);
@@ -16,76 +14,51 @@ export async function dispatchMultiChannelThreatReport(report) {
 
   const results = {
     registrar_abuse: null,
+    kominfo_aduan_konten: null,
     google_safe_browsing: null,
-    microsoft_smartscreen: null,
-    mcafee_webadvisor: null,
-    nordvpn_cybersec: null,
     dispatched_at: new Date().toISOString()
   };
 
-  // 1. Registrar & Hosting Provider Email Abuse Report
+  // 1. Registrar & Hosting Provider Email Abuse Report (real send via Resend)
   try {
     const mailResult = await sendAbuseReport(report);
     results.registrar_abuse = {
-      status: 'DISPATCHED',
+      status: mailResult.status,
       target: mailResult.to,
-      subject: mailResult.subject
+      subject: mailResult.subject,
+      message_id: mailResult.message_id || null
     };
   } catch (err) {
     results.registrar_abuse = { status: 'FAILED', error: err.message };
   }
 
-  // 2. Google Safe Browsing Submission (Triggers Red Interstitial Screen)
+  // 2. Kominfo Aduan Konten - real email intake for Indonesian content
+  // takedowns (aduankonten.id itself requires a manual account + CAPTCHA
+  // and cannot be automated; the email intake is the legitimate channel).
   try {
-    console.log(`[Dispatcher] Submitting ${targetUrl} to Google Safe Browsing Threat Feed...`);
-    results.google_safe_browsing = {
-      status: 'SUBMITTED',
-      endpoint: 'https://safebrowsing.google.com/safebrowsing/report_phish/',
-      action: 'Triggers Chrome/Firefox Red Interstitial Warning Page',
-      timestamp: new Date().toISOString()
+    const kominfoResult = await sendKominfoReport(report);
+    results.kominfo_aduan_konten = {
+      status: kominfoResult.status,
+      target: kominfoResult.to,
+      subject: kominfoResult.subject,
+      message_id: kominfoResult.message_id || null
     };
   } catch (err) {
-    results.google_safe_browsing = { status: 'FAILED', error: err.message };
+    results.kominfo_aduan_konten = { status: 'FAILED', error: err.message };
   }
 
-  // 3. Microsoft Defender SmartScreen Submission
-  try {
-    console.log(`[Dispatcher] Submitting ${targetUrl} to Microsoft Defender SmartScreen...`);
-    results.microsoft_smartscreen = {
-      status: 'SUBMITTED',
-      endpoint: 'https://www.microsoft.com/en-us/wdsi/support/report-unsafe-site',
-      action: 'Triggers Edge/Windows Defender Blocklist Protection',
-      timestamp: new Date().toISOString()
-    };
-  } catch (err) {
-    results.microsoft_smartscreen = { status: 'FAILED', error: err.message };
-  }
-
-  // 4. McAfee WebAdvisor Threat Intelligence
-  try {
-    console.log(`[Dispatcher] Submitting ${targetUrl} to McAfee WebAdvisor / Trellix SiteAdvisor...`);
-    results.mcafee_webadvisor = {
-      status: 'SUBMITTED',
-      endpoint: 'sitesubmit@mcafee.com',
-      action: 'Adds URL to McAfee Malicious Site Database',
-      timestamp: new Date().toISOString()
-    };
-  } catch (err) {
-    results.mcafee_webadvisor = { status: 'FAILED', error: err.message };
-  }
-
-  // 5. NordVPN Threat Protection & CyberSec DNS Blocklist
-  try {
-    console.log(`[Dispatcher] Submitting ${targetUrl} to NordVPN Threat Protection Blocklist...`);
-    results.nordvpn_cybersec = {
-      status: 'SUBMITTED',
-      endpoint: 'threat-intelligence@nordsecurity.com',
-      action: 'Blocks DNS resolution for NordVPN CyberSec subscribers',
-      timestamp: new Date().toISOString()
-    };
-  } catch (err) {
-    results.nordvpn_cybersec = { status: 'FAILED', error: err.message };
-  }
+  // 3. Google Safe Browsing - this is a VERIFICATION check (was this URL
+  // already run against Google's real threat lists during forensic
+  // processing), not a submission. Google has no public API to submit new
+  // URLs - only a manual report form (https://safebrowsing.google.com/safebrowsing/report_phish/).
+  results.google_safe_browsing = {
+    status: report.gsb_status || 'UNKNOWN',
+    threat_types: report.gsb_threat_types || null,
+    note: report.gsb_status
+      ? 'Verification result from Google Safe Browsing Lookup API (checked during forensic scan).'
+      : 'Not checked yet - GOOGLE_SAFE_BROWSING_API_KEY may not be configured.',
+    manual_submission_url: 'https://safebrowsing.google.com/safebrowsing/report_phish/'
+  };
 
   // Save dispatch report log locally
   try {

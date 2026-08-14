@@ -187,7 +187,8 @@ app.post('/api/reports/:id/approve', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Report not found.' });
     }
 
-    // Call Multi-Channel Threat Dispatcher (Registrar, Google Safe Browsing, SmartScreen, McAfee, NordVPN)
+    // Call Multi-Channel Threat Dispatcher (Registrar/Hosting abuse email,
+    // Kominfo Aduan Konten, Google Safe Browsing verification)
     const multiChannelResults = await dispatchMultiChannelThreatReport(report);
 
     // Update status to APPROVED
@@ -202,7 +203,7 @@ app.post('/api/reports/:id/approve', async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Report approved and dispatched across Registrar, Google Safe Browsing, SmartScreen, McAfee, and NordVPN.`,
+      message: `Report approved. Abuse email dispatched to hosting/registrar and Kominfo Aduan Konten; Google Safe Browsing status included from forensic scan.`,
       dispatched_channels: multiChannelResults
     });
 
