@@ -1,7 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { sendAbuseReport, sendKominfoReport } from './mailer.js';
+import { sendAbuseReport, sendKominfoReport, reportToVercelAbuse } from './mailer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,6 +16,7 @@ export async function dispatchMultiChannelThreatReport(report) {
     registrar_abuse: null,
     kominfo_aduan_konten: null,
     google_safe_browsing: null,
+    vercel_abuse: null,
     dispatched_at: new Date().toISOString()
   };
 
@@ -45,6 +46,29 @@ export async function dispatchMultiChannelThreatReport(report) {
     };
   } catch (err) {
     results.kominfo_aduan_konten = { status: 'FAILED', error: err.message };
+  }
+
+  // 3b. Vercel abuse desk - only fired when the CDN/host fingerprint from
+  // the forensic scan actually identified Vercel infrastructure. Vercel has
+  // no public "report abuse" API, so this emails abuse@vercel.com directly.
+  if ((report.cdn_provider || '').toLowerCase().includes('vercel')) {
+    try {
+      const vercelResult = await reportToVercelAbuse(targetUrl);
+      results.vercel_abuse = {
+        status: vercelResult.status,
+        target: vercelResult.to,
+        subject: vercelResult.subject,
+        message_id: vercelResult.id || vercelResult.message_id || null,
+        error: vercelResult.error || null
+      };
+    } catch (err) {
+      results.vercel_abuse = { status: 'FAILED', error: err.message };
+    }
+  } else {
+    results.vercel_abuse = {
+      status: 'SKIPPED',
+      note: 'CDN fingerprint did not match Vercel - no report sent.'
+    };
   }
 
   // 3. Google Safe Browsing - this is a VERIFICATION check (was this URL
