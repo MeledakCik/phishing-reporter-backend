@@ -10,12 +10,17 @@ import { getQueue } from './queue.js';
 import { initJanitor, runJanitorCheck } from './janitor.js';
 import { sendAbuseReport } from './mailer.js';
 import { dispatchMultiChannelThreatReport } from './threat_dispatcher.js';
+import { verifyTurnstileToken } from './turnstile.js';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Trust the first proxy hop (Railway/Vercel-style reverse proxies) so
+// req.ip reflects the real client IP instead of the proxy's address.
+app.set('trust proxy', 1);
 
 // Enable CORS for frontend and JSON request parsing
 // CORS_ORIGIN can be a comma-separated list of allowed origins.
@@ -35,6 +40,15 @@ app.post('/api/reports', async (req, res) => {
 
   if (!reported_url || !target_brand_raw) {
     return res.status(400).json({ success: false, message: 'URL and target brand are required.' });
+  }
+
+  // Verify the Cloudflare Turnstile token server-side before doing anything
+  // else. This is the real anti-bot gate; the frontend widget alone is not
+  // trustworthy since a POST can bypass the UI entirely.
+  const turnstileResult = await verifyTurnstileToken(captcha_token, req.ip);
+  if (!turnstileResult.success) {
+    console.warn('[API] Turnstile verification failed:', turnstileResult.errorCodes);
+    return res.status(400).json({ success: false, message: 'CAPTCHA verification failed. Please try again.' });
   }
 
   // Validate URL format
