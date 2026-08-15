@@ -33,7 +33,14 @@ function getGmailTransporter() {
   if (!gmailTransporter) {
     gmailTransporter = nodemailer.createTransport({
       service: 'gmail',
-      auth: { user, pass }
+      auth: { user, pass },
+      // Without these, a blocked/slow outbound SMTP connection (common on
+      // PaaS platforms that restrict SMTP ports) can hang the request
+      // indefinitely instead of failing. Fail fast so the approve endpoint
+      // always responds within a bounded time.
+      connectionTimeout: 10000, // 10s to establish TCP connection
+      greetingTimeout: 10000,   // 10s to receive SMTP greeting
+      socketTimeout: 15000      // 15s of inactivity on the socket
     });
   }
   return gmailTransporter;
@@ -144,7 +151,8 @@ async function dispatchEmail({ to, subject, body, attachmentPath, attachmentName
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15000) // fail fast instead of hanging the approve request
     });
 
     const data = await res.json().catch(() => ({}));

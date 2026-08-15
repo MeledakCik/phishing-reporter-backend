@@ -207,6 +207,23 @@ app.post('/api/reports/:id/approve', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Report not found.' });
     }
 
+    // Guard against duplicate/concurrent approvals: if this report is already
+    // being processed (or already done), don't kick off a second dispatch.
+    // Without this, a slow/hanging mail channel (e.g. Gmail SMTP) leaves the
+    // report at PENDING for a long time, so reloading the admin page and
+    // clicking Approve again would fire a second, overlapping dispatch.
+    if (report.status === 'APPROVING') {
+      return res.status(409).json({ success: false, message: 'This report is already being processed. Please wait for it to finish.' });
+    }
+    if (report.status !== 'PENDING') {
+      return res.status(409).json({ success: false, message: `This report is already ${report.status.toLowerCase()}.` });
+    }
+
+    await db.run(
+      `UPDATE reports SET status = 'APPROVING', updated_at = datetime('now') WHERE id = ?`,
+      id
+    );
+
     // Call Multi-Channel Threat Dispatcher (Registrar/Hosting abuse email,
     // Kominfo Aduan Konten, Google Safe Browsing verification)
     const multiChannelResults = await dispatchMultiChannelThreatReport(report);
@@ -229,6 +246,17 @@ app.post('/api/reports/:id/approve', async (req, res) => {
 
   } catch (err) {
     console.error(err);
+    // Roll back to PENDING so the report isn't stuck forever at APPROVING
+    // if the dispatch threw partway through (e.g. an unexpected error).
+    try {
+      const db = await getDb();
+      await db.run(
+        `UPDATE reports SET status = 'PENDING', updated_at = datetime('now') WHERE id = ? AND status = 'APPROVING'`,
+        id
+      );
+    } catch (rollbackErr) {
+      console.error('[API] Failed to roll back APPROVING status:', rollbackErr.message);
+    }
     return res.status(500).json({ success: false, message: 'Server error during approval process.' });
   }
 });
