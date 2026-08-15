@@ -2,9 +2,93 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Resend } from 'resend';
+import nodemailer from 'nodemailer';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+// ---------------------------------------------------------------------------
+// Gmail SMTP dispatch - used ONLY for the Kominfo Aduan Konten channel.
+//
+// Why: Kominfo's mail gateway consistently soft-bounces mail sent through
+// Resend/Amazon SES (shared IP pool), even with valid SPF/DKIM/DMARC on the
+// sending domain - confirmed by testing the exact same report content sent
+// manually from a personal Gmail account, which was delivered without issue.
+// All other channels (registrar/hosting abuse desks, Vercel abuse) continue
+// to use Resend as before, since those deliver fine.
+//
+// Configure with GMAIL_USER + GMAIL_APP_PASSWORD env vars (a Gmail App
+// Password, not the account's regular login password - see
+// https://myaccount.google.com/apppasswords, requires 2-Step Verification
+// enabled on the account).
+// ---------------------------------------------------------------------------
+
+let gmailTransporter = null;
+
+function getGmailTransporter() {
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass) return null;
+
+  if (!gmailTransporter) {
+    gmailTransporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user, pass }
+    });
+  }
+  return gmailTransporter;
+}
+
+async function dispatchEmailViaGmail({ to, subject, body, attachmentPath, attachmentName }) {
+  const user = process.env.GMAIL_USER;
+
+  console.log(`\n==================================================`);
+  console.log(`[Mailer/Gmail] TO: ${to}`);
+  console.log(`[Mailer/Gmail] SUBJECT: ${subject}`);
+  console.log(`[Mailer/Gmail] BODY:\n${body}`);
+  console.log(`==================================================\n`);
+
+  // Always keep a local audit copy regardless of send outcome.
+  try {
+    const mailDir = path.join(__dirname, '../dispatched_emails');
+    if (!fs.existsSync(mailDir)) {
+      fs.mkdirSync(mailDir, { recursive: true });
+    }
+    const mailFilePath = path.join(mailDir, `${Date.now()}_${to.replace(/[^a-z0-9]/gi, '_')}.txt`);
+    fs.writeFileSync(mailFilePath, `To: ${to}\nSubject: ${subject}\nVia: Gmail SMTP\n\n${body}`, 'utf8');
+    console.log(`[Mailer/Gmail] Local audit copy saved: ${mailFilePath}`);
+  } catch (err) {
+    console.error(`[Mailer/Gmail] Failed to save local audit copy:`, err.message);
+  }
+
+  const transporter = getGmailTransporter();
+  if (!transporter) {
+    console.warn(`[Mailer/Gmail] GMAIL_USER/GMAIL_APP_PASSWORD not configured - email was NOT actually sent, only logged/saved locally.`);
+    return { to, subject, body, status: 'SIMULATED_NOT_SENT', reason: 'GMAIL_USER or GMAIL_APP_PASSWORD missing' };
+  }
+
+  try {
+    const mailOptions = {
+      from: `"Threat Reports" <${user}>`,
+      to,
+      subject,
+      text: body
+    };
+
+    if (attachmentPath && fs.existsSync(attachmentPath)) {
+      mailOptions.attachments = [
+        { filename: attachmentName || path.basename(attachmentPath), path: attachmentPath }
+      ];
+    }
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`[Mailer/Gmail] Email actually dispatched via Gmail SMTP. Message ID: ${info.messageId}`);
+    return { to, subject, body, status: 'SENT', message_id: info.messageId };
+  } catch (err) {
+    console.error(`[Mailer/Gmail] Gmail SMTP send failed:`, err.message);
+    return { to, subject, body, status: 'FAILED', error: err.message };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Real email dispatch via the Resend API (https://resend.com).
@@ -215,5 +299,10 @@ Hormat kami,
 Local Anti-Phishing & Takedown Community Hub`;
 
   const shot = screenshotFilePath(report);
-  return dispatchEmail({ to, subject, body, attachmentPath: shot, attachmentName: `${report.id}.jpg` });
+  // Routed via Gmail SMTP (not Resend) - see dispatchEmailViaGmail() comment
+  // near the top of this file for why: Kominfo's mail gateway bounces mail
+  // sent via Resend/Amazon SES even with valid SPF/DKIM/DMARC, but accepts
+  // the identical content sent via Gmail SMTP (confirmed by manual test).
+  // The forensic screenshot is attached exactly as it was before.
+  return dispatchEmailViaGmail({ to, subject, body, attachmentPath: shot, attachmentName: `${report.id}.jpg` });
 }
