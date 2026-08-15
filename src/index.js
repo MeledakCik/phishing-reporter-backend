@@ -147,6 +147,93 @@ app.post('/api/reports', async (req, res) => {
   }
 });
 
+// 1b. Bulk Submit Phishing URLs (same brand, one CAPTCHA verification)
+// Turnstile tokens are single-use, so this verifies the token ONCE and then
+// reuses the exact same dedup/insert/queue logic as the single endpoint
+// above for each URL in the list.
+const MAX_BULK_URLS = 50;
+
+app.post('/api/reports/bulk', async (req, res) => {
+  const { urls, target_brand_raw, captcha_token } = req.body;
+
+  if (!Array.isArray(urls) || urls.length === 0 || !target_brand_raw) {
+    return res.status(400).json({ success: false, message: 'A non-empty list of URLs and a target brand are required.' });
+  }
+  if (urls.length > MAX_BULK_URLS) {
+    return res.status(400).json({ success: false, message: `Too many URLs at once. Max ${MAX_BULK_URLS} per submission.` });
+  }
+
+  const turnstileResult = await verifyTurnstileToken(captcha_token, req.ip);
+  if (!turnstileResult.success) {
+    console.warn('[API] Turnstile verification failed (bulk):', turnstileResult.errorCodes);
+    return res.status(400).json({ success: false, message: 'CAPTCHA verification failed. Please try again.' });
+  }
+
+  const db = await getDb();
+  const queue = await getQueue();
+
+  await db.run(
+    `INSERT INTO brand_suggestions (brand_name, hit_count)
+     VALUES (?, 1)
+     ON CONFLICT(brand_name) DO UPDATE SET hit_count = hit_count + 1`,
+    target_brand_raw.trim()
+  );
+
+  const results = { created: [], duplicates: [], invalid: [] };
+
+  // Sequential (not Promise.all) - keeps DB writes and queue.add() calls
+  // ordered and avoids hammering the queue/DB with 50 concurrent inserts.
+  for (const rawUrl of urls) {
+    const candidate = (rawUrl || '').trim();
+    if (!candidate) continue;
+
+    let normalizedUrl = '';
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        results.invalid.push({ url: candidate, reason: 'Only HTTP and HTTPS URLs are accepted.' });
+        continue;
+      }
+      normalizedUrl = parsed.origin + parsed.pathname.replace(/\/$/, '') + parsed.search;
+    } catch (err) {
+      results.invalid.push({ url: candidate, reason: 'Invalid URL format.' });
+      continue;
+    }
+
+    try {
+      let existingReport = await db.get('SELECT * FROM reports WHERE reported_url = ?', normalizedUrl);
+
+      if (existingReport) {
+        const newHitCount = existingReport.hit_count + 1;
+        await db.run("UPDATE reports SET hit_count = ?, updated_at = datetime('now') WHERE id = ?", newHitCount, existingReport.id);
+        results.duplicates.push(normalizedUrl);
+        continue;
+      }
+
+      const reportId = crypto.randomUUID();
+      await db.run(
+        `INSERT INTO reports (id, reported_url, target_brand_raw, status, hit_count)
+         VALUES (?, ?, ?, 'PENDING', 1)`,
+        reportId,
+        normalizedUrl,
+        target_brand_raw.trim()
+      );
+
+      await queue.add('forensic_scan', { reportId, url: normalizedUrl });
+      results.created.push(normalizedUrl);
+    } catch (err) {
+      console.error('[API] Error inserting bulk report for', normalizedUrl, err);
+      results.invalid.push({ url: normalizedUrl, reason: 'Internal database error.' });
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: `Processed ${urls.length} URLs: ${results.created.length} queued, ${results.duplicates.length} already known, ${results.invalid.length} invalid.`,
+    results
+  });
+});
+
 // 2. Check Submission Status via URL query
 app.get('/api/reports/status', async (req, res) => {
   const { url } = req.query;
