@@ -373,8 +373,8 @@ if (fs.existsSync(clientDistPath)) {
 async function start() {
   try {
     console.log(`[Build] Running build tag: ${BUILD_TAG}`);
-    console.log(`[Build] GMAIL_USER configured: ${process.env.GMAIL_USER ? 'yes' : 'NO - Kominfo emails will be SIMULATED_NOT_SENT'}`);
-    console.log(`[Build] GMAIL_APP_PASSWORD configured: ${process.env.GMAIL_APP_PASSWORD ? 'yes' : 'NO - Kominfo emails will be SIMULATED_NOT_SENT'}`);
+    const gmailReady = !!(process.env.GMAIL_USER && process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN);
+    console.log(`[Build] Gmail API OAuth2 (GMAIL_USER/GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET/GMAIL_REFRESH_TOKEN) configured: ${gmailReady ? 'yes' : 'NO - Kominfo emails will be SIMULATED_NOT_SENT'}`);
 
     // Warm up database
     await getDb();
