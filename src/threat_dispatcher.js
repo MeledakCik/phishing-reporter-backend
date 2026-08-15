@@ -17,6 +17,7 @@ export async function dispatchMultiChannelThreatReport(report) {
     apwg: null,
     kominfo_aduan_konten: null,
     google_safe_browsing: null,
+    cloudflare_abuse: null,
     vercel_abuse: null,
     dispatched_at: new Date().toISOString()
   };
@@ -99,6 +100,29 @@ export async function dispatchMultiChannelThreatReport(report) {
       : 'Not checked yet - GOOGLE_SAFE_BROWSING_API_KEY may not be configured.',
     manual_submission_url: 'https://safebrowsing.google.com/safebrowsing/report_phish/'
   };
+
+  // 4. Cloudflare abuse desk - manual-submission notice only, only fired
+  // when the CDN fingerprint from the forensic scan identified Cloudflare
+  // sitting in front of the site. Unlike registrar/APWG/Kominfo, Cloudflare
+  // does NOT accept abuse reports by email - per their own policy
+  // (cloudflare.com/trust-hub/reporting-abuse/), emailed complaints just get
+  // an automated reply pointing back to their web form, so there's no real
+  // email channel here to automate. The form also appears to require manual
+  // interaction (contact details, category selection), so this surfaces a
+  // pre-filled note + direct deep link to the "Phishing & Malware" category
+  // instead of a fake "SENT" status.
+  if ((report.cdn_provider || '').toLowerCase().includes('cloudflare')) {
+    results.cloudflare_abuse = {
+      status: 'MANUAL_SUBMISSION_REQUIRED',
+      note: `Cloudflare does not accept abuse reports by email (auto-redirects to their web form). Submit manually via the "Phishing & Malware" category: Domain = ${new URL(targetUrl).hostname}, Phishing URL = ${targetUrl}`,
+      manual_submission_url: 'https://abuse.cloudflare.com/phishing'
+    };
+  } else {
+    results.cloudflare_abuse = {
+      status: 'SKIPPED',
+      note: 'CDN fingerprint did not match Cloudflare - no manual submission needed.'
+    };
+  }
 
   // Save dispatch report log locally
   try {
