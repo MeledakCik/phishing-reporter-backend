@@ -424,9 +424,23 @@ export async function processForensicJob(jobData) {
 
     const page = await context.newPage();
     console.log(`[Worker] Browser visiting URL: ${url}`);
-    
-    // Navigate with 15s timeout
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
+
+    // Navigate using 'domcontentloaded' rather than 'networkidle': many
+    // phishing/scam sites embed live-chat widgets, ad trackers, or polling
+    // scripts that keep at least one network connection open indefinitely,
+    // so 'networkidle' (no connections for 500ms) times out on those sites
+    // even though the page has visually finished rendering. DOMContentLoaded
+    // fires as soon as the DOM is parsed and is far more reliable here.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+    // Give the page a short bonus window to let images/late scripts settle
+    // before the screenshot, but don't fail the whole job if it never goes
+    // fully idle - proceed with whatever's rendered so far.
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5000 });
+    } catch (idleErr) {
+      console.log(`[Worker] Page did not reach full network idle within 5s - proceeding with screenshot anyway.`);
+    }
 
     // Capture screenshot (JPG format)
     const screenshotFilename = `${reportId}.jpg`;
