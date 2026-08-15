@@ -14,6 +14,12 @@ import { verifyTurnstileToken } from './turnstile.js';
 
 dotenv.config();
 
+// Bump this string whenever you deploy a change you want to visually verify
+// in the logs (e.g. after fixing the Kominfo Gmail SMTP routing). Printed at
+// startup so you can immediately confirm the running process is on the new
+// build and not a stale/cached one.
+const BUILD_TAG = 'kominfo-gmail-fix-2026-08-15-01';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -338,6 +344,10 @@ if (fs.existsSync(clientDistPath)) {
 // Start Server and Janitor Cron Job Scheduler
 async function start() {
   try {
+    console.log(`[Build] Running build tag: ${BUILD_TAG}`);
+    console.log(`[Build] GMAIL_USER configured: ${process.env.GMAIL_USER ? 'yes' : 'NO - Kominfo emails will be SIMULATED_NOT_SENT'}`);
+    console.log(`[Build] GMAIL_APP_PASSWORD configured: ${process.env.GMAIL_APP_PASSWORD ? 'yes' : 'NO - Kominfo emails will be SIMULATED_NOT_SENT'}`);
+
     // Warm up database
     await getDb();
     console.log('[Database] Database initialized and seeded.');
