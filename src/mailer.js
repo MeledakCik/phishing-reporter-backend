@@ -93,7 +93,7 @@ async function dispatchEmailViaGmail({ to, subject, body, attachmentPath, attach
 // ---------------------------------------------------------------------------
 // Real email dispatch via the Resend API (https://resend.com).
 // Configure with RESEND_API_KEY + MAIL_FROM env vars.
-//
+// tes
 // If RESEND_API_KEY is not configured, emails are NOT sent - they are only
 // logged and saved to disk, and the result is explicitly marked
 // status: 'SIMULATED_NOT_SENT' so callers never mistake a local log write
