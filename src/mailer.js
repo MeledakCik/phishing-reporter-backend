@@ -2,48 +2,103 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Resend } from 'resend';
-import nodemailer from 'nodemailer';
+import { google } from 'googleapis';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ---------------------------------------------------------------------------
-// Gmail SMTP dispatch - used ONLY for the Kominfo Aduan Konten channel.
+// Gmail dispatch - used ONLY for the Kominfo Aduan Konten channel.
 //
-// Why: Kominfo's mail gateway consistently soft-bounces mail sent through
-// Resend/Amazon SES (shared IP pool), even with valid SPF/DKIM/DMARC on the
-// sending domain - confirmed by testing the exact same report content sent
-// manually from a personal Gmail account, which was delivered without issue.
-// All other channels (registrar/hosting abuse desks, Vercel abuse) continue
-// to use Resend as before, since those deliver fine.
+// Why Gmail at all: Kominfo's mail gateway consistently soft-bounces mail
+// sent through Resend/Amazon SES (shared IP pool), even with valid
+// SPF/DKIM/DMARC on the sending domain - confirmed by testing the exact same
+// report content sent manually from a personal Gmail account, which was
+// delivered without issue. All other channels (registrar/hosting abuse
+// desks, APWG, Vercel abuse) continue to use Resend as before, since those
+// deliver fine.
 //
-// Configure with GMAIL_USER + GMAIL_APP_PASSWORD env vars (a Gmail App
-// Password, not the account's regular login password - see
-// https://myaccount.google.com/apppasswords, requires 2-Step Verification
-// enabled on the account).
+// Why the Gmail REST API instead of SMTP: many PaaS hosts (Render, Railway,
+// Fly.io free tiers, etc.) block outbound SMTP ports (25/465/587) entirely,
+// which made the previous nodemailer-over-SMTP implementation hang or fail
+// to connect regardless of credentials. The Gmail REST API
+// (https://gmail.googleapis.com) is called like any other Google API - a
+// plain HTTPS POST on port 443 - so it works on hosts that block SMTP.
+//
+// Configure with an OAuth2 client (GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET,
+// from a project in Google Cloud Console with the Gmail API enabled) plus a
+// GMAIL_REFRESH_TOKEN obtained once via the OAuth consent flow for the
+// sending mailbox (scope: https://www.googleapis.com/auth/gmail.send), and
+// GMAIL_USER (the mailbox address the refresh token belongs to, used as the
+// From address).
 // ---------------------------------------------------------------------------
 
-let gmailTransporter = null;
+let gmailOAuth2Client = null;
 
-function getGmailTransporter() {
+function getGmailClient() {
   const user = process.env.GMAIL_USER;
-  const pass = process.env.GMAIL_APP_PASSWORD;
-  if (!user || !pass) return null;
+  const clientId = process.env.GMAIL_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
+  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+  if (!user || !clientId || !clientSecret || !refreshToken) return null;
 
-  if (!gmailTransporter) {
-    gmailTransporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user, pass },
-      // Without these, a blocked/slow outbound SMTP connection (common on
-      // PaaS platforms that restrict SMTP ports) can hang the request
-      // indefinitely instead of failing. Fail fast so the approve endpoint
-      // always responds within a bounded time.
-      connectionTimeout: 10000, // 10s to establish TCP connection
-      greetingTimeout: 10000,   // 10s to receive SMTP greeting
-      socketTimeout: 15000      // 15s of inactivity on the socket
-    });
+  if (!gmailOAuth2Client) {
+    gmailOAuth2Client = new google.auth.OAuth2(clientId, clientSecret);
+    gmailOAuth2Client.setCredentials({ refresh_token: refreshToken });
   }
-  return gmailTransporter;
+  return google.gmail({ version: 'v1', auth: gmailOAuth2Client });
+}
+
+// Encodes a string using RFC 2047 so non-ASCII subjects survive MIME headers.
+function encodeMimeHeader(str) {
+  return `=?UTF-8?B?${Buffer.from(str, 'utf8').toString('base64')}?=`;
+}
+
+// Builds a raw RFC 2822 MIME message (plain text + optional single
+// attachment) and base64url-encodes it, as required by the Gmail API's
+// messages.send `raw` field.
+function buildRawMimeMessage({ from, to, subject, body, attachmentPath, attachmentName }) {
+  const boundary = `----=_ThreatReports_${Date.now()}`;
+  const headers = [
+    `From: "Threat Reports" <${from}>`,
+    `To: ${to}`,
+    `Subject: ${encodeMimeHeader(subject)}`,
+    'MIME-Version: 1.0'
+  ];
+
+  let raw;
+  if (attachmentPath && fs.existsSync(attachmentPath)) {
+    const attachmentData = fs.readFileSync(attachmentPath).toString('base64');
+    const name = attachmentName || path.basename(attachmentPath);
+    headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+    raw = [
+      ...headers,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      body,
+      '',
+      `--${boundary}`,
+      `Content-Type: image/jpeg; name="${name}"`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="${name}"`,
+      '',
+      attachmentData,
+      '',
+      `--${boundary}--`
+    ].join('\r\n');
+  } else {
+    headers.push('Content-Type: text/plain; charset="UTF-8"');
+    raw = [...headers, '', body].join('\r\n');
+  }
+
+  return Buffer.from(raw)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 
 async function dispatchEmailViaGmail({ to, subject, body, attachmentPath, attachmentName }) {
@@ -62,38 +117,36 @@ async function dispatchEmailViaGmail({ to, subject, body, attachmentPath, attach
       fs.mkdirSync(mailDir, { recursive: true });
     }
     const mailFilePath = path.join(mailDir, `${Date.now()}_${to.replace(/[^a-z0-9]/gi, '_')}.txt`);
-    fs.writeFileSync(mailFilePath, `To: ${to}\nSubject: ${subject}\nVia: Gmail SMTP\n\n${body}`, 'utf8');
+    fs.writeFileSync(mailFilePath, `To: ${to}\nSubject: ${subject}\nVia: Gmail API (HTTPS)\n\n${body}`, 'utf8');
     console.log(`[Mailer/Gmail] Local audit copy saved: ${mailFilePath}`);
   } catch (err) {
     console.error(`[Mailer/Gmail] Failed to save local audit copy:`, err.message);
   }
 
-  const transporter = getGmailTransporter();
-  if (!transporter) {
-    console.warn(`[Mailer/Gmail] GMAIL_USER/GMAIL_APP_PASSWORD not configured - email was NOT actually sent, only logged/saved locally.`);
-    return { to, subject, body, status: 'SIMULATED_NOT_SENT', reason: 'GMAIL_USER or GMAIL_APP_PASSWORD missing' };
+  const gmail = getGmailClient();
+  if (!gmail) {
+    console.warn(`[Mailer/Gmail] GMAIL_USER/GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET/GMAIL_REFRESH_TOKEN not fully configured - email was NOT actually sent, only logged/saved locally.`);
+    return { to, subject, body, status: 'SIMULATED_NOT_SENT', reason: 'Gmail OAuth2 env vars missing' };
   }
 
   try {
-    const mailOptions = {
-      from: `"Threat Reports" <${user}>`,
-      to,
-      subject,
-      text: body
-    };
+    const raw = buildRawMimeMessage({ from: user, to, subject, body, attachmentPath, attachmentName });
 
-    if (attachmentPath && fs.existsSync(attachmentPath)) {
-      mailOptions.attachments = [
-        { filename: attachmentName || path.basename(attachmentPath), path: attachmentPath }
-      ];
-    }
+    const res = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw },
+      // Bound the request so a slow/unreachable Google API call can't hang
+      // the approve endpoint indefinitely.
+      // (googleapis forwards this to the underlying gaxios request)
+      timeout: 15000
+    });
 
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`[Mailer/Gmail] Email actually dispatched via Gmail SMTP. Message ID: ${info.messageId}`);
-    return { to, subject, body, status: 'SENT', message_id: info.messageId };
+    console.log(`[Mailer/Gmail] Email actually dispatched via Gmail API (HTTPS). Message ID: ${res.data.id}`);
+    return { to, subject, body, status: 'SENT', message_id: res.data.id };
   } catch (err) {
-    console.error(`[Mailer/Gmail] Gmail SMTP send failed:`, err.message);
-    return { to, subject, body, status: 'FAILED', error: err.message };
+    const errMsg = err?.response?.data?.error?.message || err.message;
+    console.error(`[Mailer/Gmail] Gmail API send failed:`, errMsg);
+    return { to, subject, body, status: 'FAILED', error: errMsg };
   }
 }
 
@@ -276,6 +329,42 @@ export async function reportToVercelAbuse(phishingUrl) {
     console.error(`[Mailer] Resend SDK request failed:`, err.message);
     return { to, subject, status: 'FAILED', error: err.message };
   }
+}
+
+// 1c. APWG (Anti-Phishing Working Group) - real send via Resend.
+// APWG has no public submission API; reportphishing@apwg.org is the
+// documented automatable intake address used by browsers/security vendors
+// to feed the eCrime Exchange threat-sharing clearinghouse.
+export async function sendApwgReport(report) {
+  const to = process.env.APWG_REPORT_EMAIL || 'reportphishing@apwg.org';
+  const hostname = new URL(report.reported_url).hostname;
+  const subject = `Phishing Report - ${hostname}`;
+  const outgoingLinksText = buildOutgoingLinksText(report);
+
+  const gsbLine = report.gsb_status === 'FLAGGED'
+    ? `\nThis URL is independently confirmed as malicious by Google Safe Browsing (threat types: ${report.gsb_threat_types || 'unknown'}).\n`
+    : '';
+
+  const body = `To the APWG eCrime Exchange,
+
+We are reporting a phishing website for inclusion in the shared threat feed:
+
+- Phishing URL: ${report.reported_url}
+- Brand Impersonated: ${report.target_brand_raw}
+- Server IP Address: ${report.ip_address || 'Unknown'}
+- Hosting Provider: ${report.hosting_provider || 'Unknown'}
+${gsbLine}
+This site harvests credentials/personal data and coordinates scams using the following external outgoing channels:
+${outgoingLinksText}
+
+A full-page rendered screenshot is attached as forensic evidence.
+
+Regards,
+Local Anti-Phishing & Takedown Community Hub
+(Automated Threat Intelligence Dispatcher)`;
+
+  const shot = screenshotFilePath(report);
+  return dispatchEmail({ to, subject, body, attachmentPath: shot, attachmentName: `${report.id}.jpg` });
 }
 
 // 2. Kominfo (Indonesian Ministry of Communication) content-abuse intake.

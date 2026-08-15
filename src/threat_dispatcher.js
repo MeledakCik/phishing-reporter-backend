@@ -1,7 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { sendAbuseReport, sendKominfoReport, reportToVercelAbuse } from './mailer.js';
+import { sendAbuseReport, sendKominfoReport, reportToVercelAbuse, sendApwgReport } from './mailer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,6 +14,7 @@ export async function dispatchMultiChannelThreatReport(report) {
 
   const results = {
     registrar_abuse: null,
+    apwg: null,
     kominfo_aduan_konten: null,
     google_safe_browsing: null,
     vercel_abuse: null,
@@ -31,6 +32,21 @@ export async function dispatchMultiChannelThreatReport(report) {
     };
   } catch (err) {
     results.registrar_abuse = { status: 'FAILED', error: err.message };
+  }
+
+  // 1b. APWG (Anti-Phishing Working Group) eCrime Exchange - real send via
+  // Resend, feeds the shared threat-intelligence clearinghouse used by many
+  // browsers/security vendors.
+  try {
+    const apwgResult = await sendApwgReport(report);
+    results.apwg = {
+      status: apwgResult.status,
+      target: apwgResult.to,
+      subject: apwgResult.subject,
+      message_id: apwgResult.message_id || null
+    };
+  } catch (err) {
+    results.apwg = { status: 'FAILED', error: err.message };
   }
 
   // 2. Kominfo Aduan Konten - real email intake for Indonesian content
