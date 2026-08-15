@@ -18,7 +18,7 @@ dotenv.config();
 // in the logs (e.g. after fixing the Kominfo Gmail SMTP routing). Printed at
 // startup so you can immediately confirm the running process is on the new
 // build and not a stale/cached one.
-const BUILD_TAG = 'kominfo-gmail-fix-2026-08-15-01';
+const BUILD_TAG = 'verify-deploy-2026-08-15-12-30';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
